@@ -1,3 +1,6 @@
+// This file was altered to make sdspi compatible with the NeoRV32 RISC-V core.
+// It was changed by Philipp Fuchs (employee at Ingenics Digital GmbH in Gräfelfing) in early 2024.
+
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Filename:	sdspidrv.c
@@ -39,24 +42,32 @@
 //
 // }}}
 #define	STDIO_DEBUG
+#include <neorv32.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
 typedef	uint8_t		BYTE;
 typedef	uint16_t	WORD;
 typedef	uint32_t	DWORD, LBA_t, UINT;
-#include <diskio.h>
+#include "diskio.h"
 
 #ifdef	STDIO_DEBUG
 #include <stdio.h>
 #include <stdlib.h>
-
+#define printf(__VA_ARGS_...) neorv32_uart0_printf(__VA_ARGS_)
 #define	txstr(A)	printf("%s", A)
-#define	txhex(A)	printf("%08x", A)
+#define	txhex(A)	printf("%x", A)
 #define	txdecimal(A)	printf("%d", A)
 
 #else
 // Embedded I/O functions txstr() and txhex
-#include "txfns.h"
+//#include "txfns.h"
+// #include "neorv32.h"
+// #include "neorv32_uart.h"
+#include "legacy.h"
+#define	txstr(A)	neorv32_uart0_printf("%s", A)
+#define	txhex(A)	neorv32_uart0_printf("%x", A)
+#define	txdecimal(A)	neorv32_uart0_printf("%d", A)
 #endif
 
 #include "sdspidrv.h"
@@ -126,7 +137,7 @@ const int	SDUSEDMA = 0;
 #endif
 
 typedef	struct SDSPI_S {
-	volatile unsigned	sd_ctrl, sd_data, sd_fifo[2];
+	volatile uint32_t	sd_ctrl, sd_data, sd_fifo[2];
 } SDSPI;
 
 typedef	struct SDSPIDRV_S {
@@ -137,8 +148,19 @@ typedef	struct SDSPIDRV_S {
 	uint32_t	d_sector_count, d_block_size;
 } SDSPIDRV;
 
-#define	SDSPI_WAIT_WHILE_BUSY(DEV)	{ int r; do { r = DEV->d_dev->sd_ctrl; if (r & (SDSPI_ERROR|SDSPI_PRESENTN)) break; } while(r & SDSPI_BUSY); }
+static volatile __attribute__((packed)) SDSPIDRV _sdspidriver;
 
+// This is set to 1 during initialization if the card behaves like an old card and responds with "illegal command" error to CMD8
+static int is_old_SD = 0;
+
+//
+// Number of retries on write or read error
+// Increasing these numbers just slightly might solve problems with older cards
+static const int N_WRITE_RETRIES = 10; 
+static const int N_READ_RETRIES = 10;
+
+#define	SDSPI_WAIT_WHILE_BUSY(DEV)	{ int r; do { r = DEV->d_dev->sd_ctrl; if (r & (SDSPI_ERROR|SDSPI_PRESENTN)) break; } while(r & SDSPI_BUSY); }
+#define SDSPI_WAIT_WHILE_BUSY_NO_BREAK(DEV) { int r; do { r = DEV->d_dev->sd_ctrl; if (r & (SDSPI_PRESENTN)) break; } while(r & SDSPI_BUSY); }
 //
 // SCOPE
 //
@@ -498,7 +520,7 @@ static	int	sdspi_read_cid(SDSPIDRV *dev) {
 	for(i=0; i<4; i++)
 		ucid[i] = dev->d_dev->sd_fifo[0];
 
-	if (1 || SDINFO) {
+	if (SDINFO) {
 		txstr("CID: ");
 		txhex(ucid[0]); txstr(":");
 		txhex(ucid[1]); txstr(":");
@@ -545,11 +567,11 @@ static	int	sdspi_read_cid(SDSPIDRV *dev) {
 		md = (md << 8) | (dev->d_CID[14] & 0x0ff);
 
 		printf("CID:\n"
-"\tManufacturer ID:  0x%02x\n"
+"\tManufacturer ID:  0x%x\n"
 "\tApplication ID:   %c%c\n"
 "\tProduct Name:     %c%c%c%c%c\n"
 "\tProduct Revision: %x.%x\n"
-"\tSerial Number:    0x%0x\n",
+"\tSerial Number:    0x%x\n",
 		dev->d_CID[0]&0x0ff,
 		dev->d_CID[1], dev->d_CID[2],
 		dev->d_CID[3], dev->d_CID[4], dev->d_CID[5],
@@ -632,8 +654,8 @@ static void	sdspi_dump_r1(const unsigned rv) {
 static void	sdspi_dump_r2(const unsigned rv) {
 	// {{{
 	if (SDDEBUG) {
-		unsigned	uv = rv >> 16;
-		txstr("R2 Decode:  "); txhex(uv & 0x0ffff);
+		unsigned	uv = rv >> 24;
+		txstr("R2 Decode:  "); txhex(rv);
 		if (uv & 0x01)
 			txstr("\r\n  Card is locked");
 		if (uv & 0x02)
@@ -651,7 +673,7 @@ static void	sdspi_dump_r2(const unsigned rv) {
 		if (uv & 0x80)
 			txstr("\r\n  Out of range | CSD overwrite");
 		txstr("\r\n");
-		sdspi_dump_r1(uv >> 8);
+		//sdspi_dump_r1(uv >> 8);
 	}
 }
 // }}}
@@ -672,15 +694,18 @@ static void	sdspi_dump_sector(const unsigned *ubuf) {
 
 static	unsigned	sdspi_get_r2(SDSPIDRV *dev) {
 	// {{{
+	uint32_t status;
+
 	dev->d_dev->sd_ctrl = SDSPI_ERROR | SDSPI_READREG | SDSPI_CMD + 13;
-	SDSPI_WAIT_WHILE_BUSY(dev);
+	SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dev);
+	status = dev->d_dev->sd_data;
 
 	if (SDDEBUG) {
 		txstr("SD_WRITE.STAT: Status return, "); txhex(dev->d_dev->sd_ctrl);
-		txstr(" : "); txhex(dev->d_dev->sd_data);
+		txstr(" : "); txhex(status);
 		txstr("\r\n");
 
-		sdspi_dump_r2(dev->d_dev->sd_ctrl);
+		sdspi_dump_r2(status);
 	}
 }
 // }}}
@@ -690,7 +715,9 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 	// int		*data = debug_data;
 	int		i, j;
 	unsigned	v;
-	SDSPIDRV *dv = (SDSPIDRV *)malloc(sizeof(SDSPIDRV));
+	is_old_SD = 0;
+	//SDSPIDRV *dv = (SDSPIDRV *)malloc(sizeof(SDSPIDRV));
+	SDSPIDRV *dv = &_sdspidriver;
 	dv->d_dev = dev;
 	dv->d_sector_count = 0;
 	dv->d_block_size   = 0;
@@ -702,6 +729,11 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 #endif
 	if (SDDEBUG)
 		txstr("SDCARD-INIT\n");
+
+	// Wait until sdspi module ready
+	SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dv);
+	dev->sd_data = 0;
+	dev->sd_ctrl = SDSPI_CLEARERR;
 
 	// Start us out slow, with a known sector length
 	dev->sd_data = SECTOR_512B | SPEED_SLOW;	// 128 word block length, 400kHz clock
@@ -732,9 +764,16 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 	if (SDDEBUG)
 		txstr("SDCARD: CMD0 GO_IDLE_STATE\n");
 
-	dev->sd_data = 0;
-	dev->sd_ctrl = SDSPI_GO_IDLE; // CMD zero
-	SDSPI_WAIT_WHILE_BUSY(dv);
+	// Send CMD0 until the correct response arrives
+	const int nCMD0=10;
+	int cnt=0;
+	do {
+		dev->sd_data = 0;
+		dev->sd_ctrl = SDSPI_GO_IDLE; // CMD zero
+		SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dv);
+		if (SDDEBUG) txstr(".");
+		cnt++;
+	} while ((dev->sd_ctrl & SDSPI_ERROR || (dev->sd_ctrl & 0xff) != 0x01) && cnt < nCMD0);
 
 	v = dev->sd_ctrl;
 	if (v & SDSPI_ERROR) {
@@ -782,7 +821,7 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 			txstr("SDCARD: CMD1 SEND_OP_COND\n");
 		dev->sd_data = 0x40000000;	// We support high capacity cards
 		dev->sd_ctrl = SDSPI_CMD+1;
-		SDSPI_WAIT_WHILE_BUSY(dv);
+		SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dv);
 
 		if ((v = dev->sd_ctrl)!= 1) {
 			if (v != 2) {
@@ -830,20 +869,31 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 		txstr("SDCARD: CMD8 SEND_IF_COND (3.3v)\n");
 	dev->sd_data = 0x001a5;
 	dev->sd_ctrl = (SDSPI_CMD|SDSPI_READREG)+8;
-	SDSPI_WAIT_WHILE_BUSY(dv);
+	SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dv);
 
 	if ((v = dev->sd_data)!= 0x01a5) {
 #ifdef	SCOPE
 		SCOPE->s_ctrl = WBSCOPE_TRIGGER | SCOPEDELAY;
 #endif
-		txstr("SDCARD: SEND_IF_COND status ");
-		txhex(v);
-		txstr(", != 0x01a5 as expected\r\n");
-		sdcard_err |= SDERR_INIT | 0x2000;
+		if (SDDEBUG || SDINFO) {
+			txstr("\rSDCARD: SEND_IF_COND status ");
+			txhex(v);
+			txstr(", != 0x01a5 as expected\r\n");
+			txstr("This seems to be an old card. \rSending 0x0 data payload with ACMD41.\r");
+		}
+		// Clear any prior pending errors
+		dev->sd_data = 0;
+		dev->sd_ctrl = SDSPI_CLEARERR;
 
-		dv->d_sector_count = 0;
-		dv->d_block_size   = 0;
-		return dv;
+		// Set is_old_SD to 1 so our driver can later accomodate this ancient card
+		// I believe that responding with "illegal error" makes it certain that we have an standard capacity card, so this flag also changes read and write addressing behavior
+		// We also set this flag later if we get find that CCS=1 
+		is_old_SD = 1;
+
+		// sdcard_err |= SDERR_INIT | 0x2000;
+		// dv->d_sector_count = 0;
+		// dv->d_block_size   = 0;
+		// return dv;
 	}
 
 	if (SDDEBUG) {
@@ -876,24 +926,30 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 			//
 			dev->sd_data = 0;
 			dev->sd_ctrl = SDSPI_ACMD;	// 0x70 = 'd55 + 'h40
-			SDSPI_WAIT_WHILE_BUSY(dv);
+			SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dv);
 
 			//
 			// Send the ACMD41 itself
 			//
-			dev->sd_data = 0x40000000; // Support high capacity
+			if (is_old_SD == 0) {
+				dev->sd_data = 0x40000000; // Support high capacity
+			} else {
+				dev->sd_data = 0;
+			}
 			dev->sd_ctrl = SDSPI_CMD + 41; // 0x69; // 0x040+41;
-			SDSPI_WAIT_WHILE_BUSY(dv);
+			SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dv);
 
 			dev_busy = dev->sd_ctrl&1;
 			iterations++;
 
-			if (SDDEBUG && (dev->sd_ctrl == 1))
+			if (SDDEBUG && dev_busy)
 				txstr(".");
 		} while(dev_busy && (iterations < MAX_ITERATIONS));
 
-		if (iterations >= MAX_ITERATIONS)
+		if (iterations >= MAX_ITERATIONS) {
 			sdcard_err |= SDERR_INIT | 0x4000;
+			if (SDDEBUG) txstr("MAX_ITERATIONS of ACMD 41 reached.\rCheck general connectivity to card.\rCheck VDD supply to card.\r");
+		}
 	}
 
 	//
@@ -990,66 +1046,78 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 		return dv;
 	}
 
+	if (SDDEBUG) {
+		printf("\rCSD Contents:\r");
+		for (int i=0;i<16;i++) {
+			printf("Byte %i, Bits from %i: %x\r", i, 127-i*8, dv->d_CSD[i]);
+		}
+		printf("If this makes no sense (check sd specifications) then check endianness.\r");
+	}
+
 	if (0x00 == (dv->d_CSD[0] & 0xc0)) {
 		// {{{
 		// Standard capacity card, CSD v1
 		//
-		unsigned	C_SIZE, C_SIZE_MULT, READ_BL_LEN,
-				BLOCK_LEN, BLOCKNR, SECTOR_SIZE,
-				WRITE_BL_LEN;
+		// Set this flag (if we haven't already) to change addressing behavior for the read and write commands
+		//is_old_SD = 1;
 
-		C_SIZE  =  dv->d_CSD[6] & 0x0ff;
-		C_SIZE |= (dv->d_CSD[7] & 0x0ff) | (C_SIZE << 8);
-		C_SIZE |= (dv->d_CSD[8] & 0x0ff) | (C_SIZE << 8);
+		uint32_t C_SIZE_MULT, READ_BL_LEN, WRITE_BL_LEN, C_SIZE, BLOCKNR, SECTOR_SIZE, BLOCK_LEN;
+
+		C_SIZE =  dv->d_CSD[6] & 0x0ff;
+		C_SIZE = (dv->d_CSD[7] & 0x0ff) | (C_SIZE << 8);
+		C_SIZE = (dv->d_CSD[8] & 0x0ff) | (C_SIZE << 8);
 
 		C_SIZE >>= 6;
 		C_SIZE &= 0x0fff;
 
-		C_SIZE_MULT  = (dv->d_CSD[ 9]& 0x0ff);
-		C_SIZE_MULT |= (dv->d_CSD[10]& 0x0ff) | (C_SIZE_MULT << 8);
+		C_SIZE_MULT = (dv->d_CSD[ 9]& 0x0ff);
+		C_SIZE_MULT = (dv->d_CSD[10]& 0x0ff) | (C_SIZE_MULT << 8);
 
 		C_SIZE_MULT >>= 7;
 		C_SIZE_MULT &= 0x07;
 
 		READ_BL_LEN = (dv->d_CSD[ 5]& 0x0f);
 
-		BLOCK_LEN = (1ul<<(READ_BL_LEN));
+		BLOCK_LEN = (1 << (READ_BL_LEN));
 		// gbl_sector_size = BLOCK_LEN;
-		BLOCKNR  = (C_SIZE+1ul) * (1ul << (C_SIZE_MULT+2));
+		BLOCKNR  = (C_SIZE+1) * (1 << (C_SIZE_MULT+2));
 		dv->d_sector_count = BLOCKNR;
 
 		// Get the size of an erasable sector
-		SECTOR_SIZE  = (dv->d_CSD[10]& 0x0ff);
-		SECTOR_SIZE |= (dv->d_CSD[11]& 0x0ff) | (SECTOR_SIZE << 8);
+		SECTOR_SIZE = (dv->d_CSD[10]& 0x0ff);
+		SECTOR_SIZE = (dv->d_CSD[11]& 0x0ff) | (SECTOR_SIZE << 8);
 		SECTOR_SIZE >>= 7;
 		SECTOR_SIZE &= 0x07f;
+		SECTOR_SIZE++;
 
 
-		WRITE_BL_LEN  = (dv->d_CSD[12]& 0x03);
-		WRITE_BL_LEN |= (dv->d_CSD[13]& 0x0ff) | (WRITE_BL_LEN << 8);
+		WRITE_BL_LEN = (dv->d_CSD[12]& 0x03);
+		WRITE_BL_LEN = (dv->d_CSD[13]& 0x0ff) | (WRITE_BL_LEN << 8);
 		WRITE_BL_LEN >>= 6;
 		WRITE_BL_LEN &= 0x0f;
 #ifdef	STDIO_DEBUG
 		if (SDDEBUG) {
 			printf("LO:\n"
-			"  C_SIZE_MULT  = %6d\n"
-			"  C_SIZE       = %6d\n"
-			"  READ_BL_LEN  = %6d\n"
-			"  SECTOR_SIZE  = %6d\n"
-			"  WRITE_BL_LEN = %6d\n",
+			"  C_SIZE_MULT  = %d\n"
+			"  C_SIZE       = %d\n"
+			"  READ_BL_LEN  = %d\n"
+			"  SECTOR_SIZE  = %d\n"
+			"  WRITE_BL_LEN = %d\n",
 					C_SIZE_MULT, C_SIZE,
 					READ_BL_LEN, SECTOR_SIZE,
 					WRITE_BL_LEN);
 		}
 #endif
 
-		dv->d_block_size = (SECTOR_SIZE + 2)*WRITE_BL_LEN;
+		//dv->d_block_size = (SECTOR_SIZE + 2)* WRITE_BL_LEN;
+		dv->d_block_size = SECTOR_SIZE * WRITE_BL_LEN;
 		// }}}
 	} else if (0x40 == (dv->d_CSD[0] & 0xc0)) {
 		// {{{
 		// High capacity and extended capacity cards, CSD v2
 		//
-		unsigned	C_SIZE, READ_BL_LEN,
+		uint64_t C_SIZE;
+		unsigned	READ_BL_LEN,
 				BLOCK_LEN, BLOCKNR;
 
 		READ_BL_LEN = 9;
@@ -1059,18 +1127,19 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 		C_SIZE = (dv->d_CSD[7]& 0x0ff);
 		C_SIZE = (dv->d_CSD[8]& 0x0ff) | (C_SIZE << 8);
 		C_SIZE = (dv->d_CSD[9]& 0x0ff) | (C_SIZE << 8);
-		C_SIZE = 0x03fffff;
+		C_SIZE &= 0x03fffff;
 
 		// User data capacity is given by (C_SIZE+1)*512kB
 		// Hence we have (C_SIZE+1)*512*1024 / 512 sectors, or...
-		dv->d_sector_count = (C_SIZE+1ul) * 1024;
+		dv->d_sector_count = (C_SIZE+1) * (uint64_t) 1024;
 #ifdef	STDIO_DEBUG
 		if (SDDEBUG) {
 			printf("HS: C_SIZE = %d\n", C_SIZE);
-			printf("  From ... %02x%02x%02x\n",
+			printf("  From ... %x%x%x\n",
 				dv->d_CSD[7]&0x0ff,dv->d_CSD[8]&0x0ff,
 				dv->d_CSD[9]&0x0ff);
-			printf("  Card Size = %lu\n", (unsigned long)dv->d_sector_count * 512ul);
+			printf("  Card Size(HIGH) = %d\n", ((uint64_t)dv->d_sector_count * (uint64_t) 512) >> 32 );
+			printf("  Card Size(LOW) = %u\n", ((uint64_t)dv->d_sector_count * (uint64_t) 512) & 0xFFFFFFFF );
 		}
 #endif
 
@@ -1079,7 +1148,7 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 	} else {
 		// {{{
 #ifdef	STDIO_DEBUG
-		printf("Unrecognizable CSD: %02x %02x %02x ...\n",
+		printf("Unrecognizable CSD: %x %x %x ...\n",
 			dv->d_CSD[0] & 0x0ff, dv->d_CSD[1] & 0x0ff,
 			dv->d_CSD[2] & 0x0ff);
 #else
@@ -1109,15 +1178,15 @@ SDSPIDRV *sdspi_init(SDSPI *dev) {
 
 	// }}}
 
-	return 0;
+	return dv;
 }
 // }}}
 
 int	sdspi_read(SDSPIDRV *dev, const unsigned sector, const unsigned count, char *buf) {
 	// {{{
 	unsigned	*ubuf = (unsigned *)buf, k;
+	uint32_t retries=N_READ_RETRIES;
 	int		j, st = 0;
-
 	if (SDDEBUG) {
 		txstr("SDCARD-READ: ");
 		txhex(sector);
@@ -1130,56 +1199,87 @@ int	sdspi_read(SDSPIDRV *dev, const unsigned sector, const unsigned count, char 
 	for(k=0; k<count; k++) {
 		unsigned	*ubuf = (unsigned *)&buf[k*512];
 
-		if (dev->d_dev->sd_ctrl & SDSPI_REMOVED) {
-			txstr("ERR: SD-Card was removed\n");
-			st = RES_ERROR;
-			break;
-		}
+//retry_read:
+		do {
+			st = 0;
 
-		// 512 byte block length, 25MHz clock
-		//
-		// Write config data, read last config data
-		dev->d_dev->sd_data = SECTOR_512B | SPEED_FAST;
-		dev->d_dev->sd_ctrl = SDSPI_SETAUX;
+			if (dev->d_dev->sd_ctrl & SDSPI_REMOVED) {
+				txstr("ERR: SD-Card was removed\n");
+				st = RES_ERROR;
+				return st;
+			}
 
-		//
-		// Issue the read command
-		//
-		dev->d_dev->sd_data = sector+k; // sector to read from
-		dev->d_dev->sd_ctrl = SDSPI_READ_SECTOR;	// CMD 17, into FIFO 0
-		SDSPI_WAIT_WHILE_BUSY(dev);
+			// 512 byte block length, 25MHz clock
+			//
+			// Write config data, read last config data
+			dev->d_dev->sd_data = SECTOR_512B | SPEED_FAST;
+			dev->d_dev->sd_ctrl = SDSPI_SETAUX;
 
+			//
+			// Issue the read command
+			//
+			// Old "sc" (standard capacity) cards are byte addressable.
+			// Still, addresses in read or write commands must adhere to the block length (standard: 512 Bytes).
+			// Therefore, the "sector" variable needs to be multiplied by 512 to produce correct addresses.
+			if (is_old_SD == 1) {
+				dev->d_dev->sd_data = 512 * (sector+k);
+			} else {
+				dev->d_dev->sd_data = sector+k;
+			}
+			// dev->d_dev->sd_data = sector+k; // sector to read from
+			dev->d_dev->sd_ctrl = SDSPI_READ_SECTOR;	// CMD 17, into FIFO 0
+			SDSPI_WAIT_WHILE_BUSY(dev);
+
+			if (SDDEBUG) {
+				if (dev->d_dev->sd_ctrl & 0x8000) {
+					txstr("Error: ");
+					txhex(dev->d_dev->sd_ctrl);
+					txstr("\n");
+				}
+			}
 #ifdef	INCLUDE_DMA_CONTROLLER
-		if (SDUSEDMA && ((_zip->z_dma.d_ctrl & DMA_BUSY) == 0)) {
-			_zip->z_dma.d_len= 512/sizeof(char);
-			_zip->z_dma.d_rd = (char *)&dev->d_dev->sd_fifo[0];
-			_zip->z_dma.d_wr = &buf[k*512];
-			_zip->z_dma.d_ctrl = DMAREQUEST|DMACLEAR|DMA_DSTWIDE
-					| DMA_CONSTSRC|DMA_SRCWORD;
-			while(_zip->z_dma.d_ctrl & DMA_BUSY)
-				;
-			CLEAR_DCACHE;
-		} else
+			if (SDUSEDMA && ((_zip->z_dma.d_ctrl & DMA_BUSY) == 0)) {
+				_zip->z_dma.d_len= 512/sizeof(char);
+				_zip->z_dma.d_rd = (char *)&dev->d_dev->sd_fifo[0];
+				_zip->z_dma.d_wr = &buf[k*512];
+				_zip->z_dma.d_ctrl = DMAREQUEST|DMACLEAR|DMA_DSTWIDE
+						| DMA_CONSTSRC|DMA_SRCWORD;
+				while(_zip->z_dma.d_ctrl & DMA_BUSY)
+					;
+				CLEAR_DCACHE;
+			} else
 #endif
-			for(j=0; j<512/4; j++)
-				ubuf[j] = dev->d_dev->sd_fifo[0];
+				for(j=0; j<512/4; j++) {
+					ubuf[j] = dev->d_dev->sd_fifo[0];
+				}
+			if (SDDEBUG && SDINFO)
+				sdspi_dump_sector(ubuf);
 
-		if (SDDEBUG && SDINFO)
-			sdspi_dump_sector(ubuf);
-
-		if (dev->d_dev->sd_ctrl & (SDSPI_ERROR | SDSPI_REMOVED)) {
-			txstr("READ ERR!\r\n");
-//			sdspi_get_r2(dev);
-			st = -1;
-			break;
-		}
-	} return st;
+			if (dev->d_dev->sd_ctrl & (SDSPI_ERROR | SDSPI_REMOVED)) {
+				dev->d_dev->sd_ctrl = SDSPI_CLEARERR;
+				txstr("READ ERR!\r\n");
+				sdspi_get_r2(dev);
+				st = -1;
+				if (retries) {
+					retries--;
+					if (SDDEBUG) txstr(".");
+					//goto retry_read;
+				} 
+				//break;
+			}
+			else {
+				retries = N_READ_RETRIES;
+			}
+		} while (st != 0 && retries > 0);
+	} 
+	return st;
 }
 // }}}
 
 int	sdspi_write(SDSPIDRV *dev, const unsigned sector, const unsigned count, const char *buf) {
 	// {{{
 	unsigned	vc, vd, st = 0, k;
+	uint32_t retries=N_WRITE_RETRIES;
 
 	if (SDDEBUG) {
 		txstr("SDCARD-WRITE: ");
@@ -1193,66 +1293,85 @@ int	sdspi_write(SDSPIDRV *dev, const unsigned sector, const unsigned count, cons
 	for(k=0; k<count; k++) {
 		const unsigned *ubuf = (unsigned *)(&buf[k*512]);
 
-		if (dev->d_dev->sd_ctrl & SDSPI_REMOVED) {
-			txstr("ERR: SD-Card was removed\n");
-			st = -1;
-			break;
-		}
+//retry_write:
+		do {
+			st=0;
+			if (dev->d_dev->sd_ctrl & SDSPI_REMOVED) {
+				txstr("ERR: SD-Card was removed\n");
+				st = -1;
+				break;
+			}
+			// For our next test, let us write and then read sector 2.
+			//	 128 word block length, 20MHz clock
+			dev->d_dev->sd_data = SECTOR_512B | SPEED_FAST;
 
-		// For our next test, let us write and then read sector 2.
-		//	 128 word block length, 20MHz clock
-		dev->d_dev->sd_data = SECTOR_512B | SPEED_FAST;
+			// Write config data, read last config data
+			// This also resets our FIFO to the beginning, so we can start
+			// writing into it from the beginning.
+			dev->d_dev->sd_ctrl = SDSPI_SETAUX;
 
-		// Write config data, read last config data
-		// This also resets our FIFO to the beginning, so we can start
-		// writing into it from the beginning.
-		dev->d_dev->sd_ctrl = SDSPI_SETAUX;
-
-		if (SDDEBUG && SDINFO)
-			sdspi_dump_sector(ubuf);
+			if (SDDEBUG && SDINFO)
+				sdspi_dump_sector(ubuf);
 
 #ifdef	INCLUDE_DMA_CONTROLLER
-		if (SDUSEDMA && ((_zip->z_dma.d_ctrl & DMA_BUSY) == 0)) {
-			_zip->z_dma.d_len= 512/sizeof(char);
-			_zip->z_dma.d_rd = (char *)&ubuf;
-			_zip->z_dma.d_wr = (char *)&dev->d_dev->sd_fifo[0];
-			_zip->z_dma.d_ctrl = DMAREQUEST|DMACLEAR|DMA_SRCWIDE
-						| DMA_CONSTDST|DMA_DSTWORD;
-			while(_zip->z_dma.d_ctrl & DMA_BUSY)
-				;
-		} else
+			if (SDUSEDMA && ((_zip->z_dma.d_ctrl & DMA_BUSY) == 0)) {
+				_zip->z_dma.d_len= 512/sizeof(char);
+				_zip->z_dma.d_rd = (char *)&ubuf;
+				_zip->z_dma.d_wr = (char *)&dev->d_dev->sd_fifo[0];
+				_zip->z_dma.d_ctrl = DMAREQUEST|DMACLEAR|DMA_SRCWIDE
+							| DMA_CONSTDST|DMA_DSTWORD;
+				while(_zip->z_dma.d_ctrl & DMA_BUSY)
+					;
+			} else
 #endif
-			for(int i=0; i<512/4; i++)
-				dev->d_dev->sd_fifo[0] = ubuf[i];
+				for(int i=0; i<512/4; i++)
+					dev->d_dev->sd_fifo[0] = ubuf[i];
 
-		dev->d_dev->sd_data = sector+k;
-		dev->d_dev->sd_ctrl = SDSPI_WRITE_SECTOR;
+			// Old sc (standard capacity) cards are byte addressable.
+			// Still, addresses in read or write commands must adhere to the block length (standard: 512 Bytes).
+			// Therefore, the "sector" variable needs to be multiplied by 512 to produce correct addresses.
+			if (is_old_SD == 1) {
+				dev->d_dev->sd_data = 512 * (sector+k);
+			} else {
+				dev->d_dev->sd_data = sector+k;
+			}
+			// dev->d_dev->sd_data = sector+k;
+			dev->d_dev->sd_ctrl = SDSPI_WRITE_SECTOR;
 
-		SDSPI_WAIT_WHILE_BUSY(dev);
+			SDSPI_WAIT_WHILE_BUSY_NO_BREAK(dev);
 
-		vc = dev->d_dev->sd_ctrl;
-		vd = dev->d_dev->sd_data;
+			vc = dev->d_dev->sd_ctrl;
+			vd = dev->d_dev->sd_data;
 
-		if (SDDEBUG) {
-			if ((vc & SDSPI_ERROR) || ((vd & 0x01f) != 0x05)) {
-				txstr("WRITE ERR!  Response token = ");
-				txhex(vc);
-				txstr(" : ");
-				txhex(vd);
-				txstr("\r\n");
+			if (SDDEBUG) {
+				if ((vc & SDSPI_ERROR) || ((vd & 0x01f) != 0x05)) {
+					txstr("WRITE ERR!  Response token = ");
+					txhex(vc);
+					txstr(" : ");
+					txhex(vd);
+					txstr("\r\n");
+				}
+
+				if (SDINFO)
+					sdspi_get_r2(dev);
 			}
 
-			if (SDINFO)
-				sdspi_get_r2(dev);
-		}
-
-		if (vc & SDSPI_ERROR) {
-			dev->d_dev->sd_ctrl = SDSPI_CLEARERR;
-			st = -1;
-			break;
-		}
+			if (vc & (SDSPI_ERROR | SDSPI_REMOVED)) {
+				dev->d_dev->sd_ctrl = SDSPI_CLEARERR;
+				st = 1;
+				if (retries) {
+					retries--;
+					if (SDDEBUG) txstr(".");
+					//goto retry_write;
+				} 
+				//break;
+			}
+			else {
+				retries = N_WRITE_RETRIES;
+			}
+		} while (st != 0 && retries > 0);
 	}
-	return 0;
+	return st;
 }
 // }}}
 

@@ -1,3 +1,6 @@
+// This file was altered to make sdspi compatible with the NeoRV32 RISC-V core.
+// It was changed by Philipp Fuchs (employee at Ingenics Digital GmbH in Gräfelfing) in early 2024.
+
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Filename:	diskio.c
@@ -40,17 +43,25 @@
 // }}}
 #include "ff.h"		// From FATFS
 #include "diskio.h"	// From FATFS as well
-#include "board.h"	// Defines associated with the driver
+
+//#include "board.h"	// Defines associated with the driver
+// Definitions replacing those found in ZipCPU board.h:
+#define	_BOARD_HAS_SDSPI
+typedef	struct SDSPI_S {
+	uint32_t	sd_ctrl, sd_data, sd_fifo[2];
+} SDSPI;
+static volatile __attribute__((aligned(4))) SDSPI *const _sdspi = ((SDSPI *)0xC0000000); // SDSPI address
+
 #include "sdspidrv.h"
-#include "sdiodrv.h"
-#include "emmcdrv.h"
+//#include "sdiodrv.h"
+//#include "emmcdrv.h"
 #include "diskiodrvr.h"
 
 // #define	STDIO_DEBUG
-#include "zipcpu.h"
+//#include "zipcpu.h"
 
 #ifdef	STDIO_DEBUG
-#include <stdio.h>
+//#include <stdio.h>
 #define	DBGPRINTF	printf
 #else
 #define	DBGPRINTF	null

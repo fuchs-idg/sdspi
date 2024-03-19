@@ -1,3 +1,6 @@
+// This file was altered to make sdspi compatible with the NeoRV32 RISC-V core.
+// It was changed by Philipp Fuchs (employee at Ingenics Digital GmbH in Gräfelfing) in early 2024.
+
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Filename: 	diskiodrvr.h
@@ -54,9 +57,9 @@ typedef	struct	DISKIODRVR_S {
 	DIO_IOCTL_FN	dio_ioctl;
 } DISKIODRVR;
 
-DISKIODRVR	SDIODRVR  = { (DIO_INIT_FN)&sdio_init, (DIO_WRITE_FN)&sdio_write, (DIO_READ_FN)&sdio_read, (DIO_IOCTL_FN)&sdio_ioctl  };
+///DISKIODRVR	SDIODRVR  = { (DIO_INIT_FN)&sdio_init, (DIO_WRITE_FN)&sdio_write, (DIO_READ_FN)&sdio_read, (DIO_IOCTL_FN)&sdio_ioctl  };
 DISKIODRVR	SDSPIDRVR = { (DIO_INIT_FN)&sdspi_init,(DIO_WRITE_FN)&sdspi_write,(DIO_READ_FN)&sdspi_read,(DIO_IOCTL_FN)&sdspi_ioctl };
-DISKIODRVR	EMMCDRVR  = { (DIO_INIT_FN)&emmc_init, (DIO_WRITE_FN)&emmc_write, (DIO_READ_FN)&emmc_read, (DIO_IOCTL_FN)&emmc_ioctl };
+///DISKIODRVR	EMMCDRVR  = { (DIO_INIT_FN)&emmc_init, (DIO_WRITE_FN)&emmc_write, (DIO_READ_FN)&emmc_read, (DIO_IOCTL_FN)&emmc_ioctl };
 
 typedef	struct	FATDRIVE_S {
 	void		*fd_addr;
@@ -69,24 +72,26 @@ typedef	struct	FATDRIVE_S {
 // there's one FATDRIVE triplet per drive on the board, and so that MAX_DRIVES
 // contains the number of items in the table.
 //
-#define	MAX_DRIVES	4
-FATDRIVE	DRIVES[MAX_DRIVES] = {
-#ifdef	_BOARD_HAS_SDIO
-		{ (void *)_sdio, &SDIODRVR, NULL },
-#else
-		{ NULL, NULL, NULL },
-#endif
-#ifdef	_BOARD_HAS_SDSPI
-		{ (void *)_sdspi, &SDSPIDRVR, NULL },
-#else
-		{ NULL, NULL, NULL },
-#endif
-#ifdef	_BOARD_HAS_EMMC
-		{ (void *)_emmc, &EMMCDRVR, NULL },
-#else
-		{ NULL, NULL, NULL },
-#endif
-		{NULL, NULL, NULL }
-	};
+#define	MAX_DRIVES	1
+FATDRIVE DRIVES[MAX_DRIVES] = {{ (void *)_sdspi, &SDSPIDRVR, NULL }};
+// #define	MAX_DRIVES	4
+// FATDRIVE	DRIVES[MAX_DRIVES] = {
+// #ifdef	_BOARD_HAS_SDIO
+// 		{ (void *)_sdio, &SDIODRVR, NULL },
+// #else
+// 		{ NULL, NULL, NULL },
+// #endif
+// #ifdef	_BOARD_HAS_SDSPI
+// 		{ (void *)_sdspi, &SDSPIDRVR, NULL },
+// #else
+// 		{ NULL, NULL, NULL },
+// #endif
+// #ifdef	_BOARD_HAS_EMMC
+// 		{ (void *)_emmc, &EMMCDRVR, NULL },
+// #else
+// 		{ NULL, NULL, NULL },
+// #endif
+// 		{NULL, NULL, NULL }
+// 	};
 
 #endif
